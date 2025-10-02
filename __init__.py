@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2025 Andreas Pardeike
 
+# pyright: reportInvalidTypeForm=false
+
 bl_info = {
     "name": "NURBS2Mesh",
     "author": "Andreas",
@@ -135,6 +137,35 @@ def _float_bytes(v: float) -> bytes:
     return struct.pack('<d', float(v))
 
 
+def _modifier_fingerprint(obj) -> bytes:
+    mods = getattr(obj, 'modifiers', None)
+    if not mods:
+        return b''
+    parts = []
+    for mod in mods:
+        entries = [mod.type, '1' if getattr(mod, 'show_viewport', True) else '0']
+        if hasattr(mod, 'show_render'):
+            entries.append('1' if mod.show_render else '0')
+        props = []
+        for prop in mod.bl_rna.properties:
+            if prop.is_readonly or prop.identifier in {'rna_type', 'name', 'type', 'show_viewport', 'show_render'}:
+                continue
+            try:
+                value = getattr(mod, prop.identifier)
+            except AttributeError:
+                continue
+            if prop.type == 'POINTER':
+                value = getattr(value, 'name', None)
+            elif prop.type == 'COLLECTION':
+                value = tuple(getattr(item, 'name', None) for item in value)
+            props.append((prop.identifier, value))
+        if props:
+            entries.append(repr(sorted(props)))
+        parts.append('|'.join(str(entry) for entry in entries))
+    return '\u0001'.join(parts).encode()
+    return struct.pack('<d', float(v))
+
+
 def _curve_fingerprint(src_obj) -> str | None:
     data = getattr(src_obj, 'data', None)
     if not data or not isinstance(data, bpy.types.Curve):
@@ -182,6 +213,7 @@ def _curve_fingerprint(src_obj) -> str | None:
                     h.update(_float_bytes(f))
                 h.update(_float_bytes(getattr(p, 'tilt', 0.0)))
                 h.update(_float_bytes(getattr(p, 'radius', 1.0)))
+    h.update(_modifier_fingerprint(src_obj))
     return h.hexdigest()
 
 
@@ -275,7 +307,7 @@ class N2M_OT_link_mesh(Operator):
         prefs = context.preferences.addons[__name__].preferences
 
         mesh = _build_mesh_from_object(src)
-        name_base = f"{src.name}_N2M"
+        name_base = f"{src.name} Mesh"
         new_obj = bpy.data.objects.new(name_base, mesh)
         coll = _first_users_collection(src, context)
         coll.objects.link(new_obj)
