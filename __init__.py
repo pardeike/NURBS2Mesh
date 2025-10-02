@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-# Copyright (C) 2025 Andreas
+# Copyright (C) 2025 Andreas Pardeike
 
 bl_info = {
     "name": "NURBS2Mesh",
@@ -11,8 +11,10 @@ bl_info = {
     "category": "Object",
 }
 
+import hashlib
+import struct
+import time
 import bpy
-import functools
 from bpy.app.handlers import persistent
 from bpy.props import (
     BoolProperty,
@@ -114,18 +116,108 @@ def _update_now_by_source_name(src_name):
             print(f"[NURBS2Mesh] Update failed for {t.name}: {ex}")
 
 # --------------------------
+# Auto-update
+# --------------------------
+
+_FP = {}          # source_name -> last fingerprint
+_PENDING = {}     # source_name -> last change time
+
+def _float_bytes(v: float) -> bytes:
+    return struct.pack('<d', float(v))
+
+def _curve_fingerprint(src_obj) -> str | None:
+    cu = getattr(src_obj, "data", None)
+    if not cu or cu.__class__.__name__ != "Curve":
+        return None
+    h = hashlib.blake2b(digest_size=16)
+
+    # Curve datablock settings that affect tessellation
+    for name in (
+        "dimensions", "resolution_u", "resolution_v",
+        "render_resolution_u", "render_resolution_v",
+        "bevel_depth", "bevel_resolution", "extrude", "offset",
+        "twist_smooth", "use_fill_caps", "use_fill_deform",
+    ):
+        if hasattr(cu, name):
+            h.update(str(getattr(cu, name)).encode())
+
+    # Spline topology + control data
+    for spl in cu.splines:
+        h.update(spl.type.encode())
+        for name in ("use_cyclic_u","use_cyclic_v","order_u","order_v","resolution_u","resolution_v"):
+            if hasattr(spl, name):
+                h.update(str(getattr(spl, name)).encode())
+
+        if spl.type == 'BEZIER':
+            for bp in spl.bezier_points:
+                for vec in (bp.handle_left, bp.co, bp.handle_right):
+                    for f in vec:
+                        h.update(_float_bytes(f))
+                h.update(_float_bytes(bp.tilt))
+                h.update(_float_bytes(bp.radius))
+        else:
+            for p in spl.points:  # NURBS/Poly and Surface use SplinePoint(4D)
+                for f in p.co:  # includes weight (w)
+                    h.update(_float_bytes(f))
+                h.update(_float_bytes(getattr(p, "tilt", 0.0)))
+                h.update(_float_bytes(getattr(p, "radius", 1.0)))
+
+    # Note: bevel/taper object geometry isn’t hashed here; if you use them, tap Update Now.
+    return h.hexdigest()
+
+def _linked_sources_active():
+    """Map source -> [targets] for auto-updating links."""
+    links = {}
+    for t in bpy.data.objects:
+        if t.type == 'MESH' and getattr(t, "n2m", None) and t.n2m.source and t.n2m.auto_update:
+            src = t.n2m.source
+            if not getattr(src, "type", None):
+                continue
+            if src.type in {'CURVE', 'SURFACE'}:
+                links.setdefault(src, []).append(t)
+    return links
+
+def _n2m_heartbeat():
+    now = time.time()
+    links = _linked_sources_active()
+    if not links:
+        return 1.0  # sleep longer if nothing to do
+
+    for src, targets in links.items():
+        fp = _curve_fingerprint(src)
+        if not fp:
+            continue
+        prev = _FP.get(src.name)
+        if prev != fp:
+            _FP[src.name] = fp
+            _PENDING[src.name] = now
+            continue
+
+        last = _PENDING.get(src.name)
+        if last is not None:
+            delay = min(max(t.n2m.debounce, 0.0) for t in targets)
+            if (now - last) >= delay:
+                try:
+                    if src and getattr(src, 'name', None):
+                        _update_now_by_source_name(src.name)
+                finally:
+                    _PENDING.pop(src.name, None)
+
+    return 0.1  # poll rate; cheap and responsive
+
+# --------------------------
 # Properties
 # --------------------------
 
 class N2M_Preferences(AddonPreferences):
     bl_idname = __name__
 
-    default_debounce: FloatProperty(
+    default_debounce = FloatProperty(
         name="Default Debounce (s)",
         description="Delay after last edit before auto-update runs",
         min=0.0, default=0.25, subtype='TIME'
     )
-    auto_parent: BoolProperty(
+    auto_parent = BoolProperty(
         name="Parent new mesh to source",
         description="Keep transforms in sync by parenting mesh copy to source",
         default=True,
@@ -137,32 +229,32 @@ class N2M_Preferences(AddonPreferences):
         layout.prop(self, "auto_parent")
 
 class N2M_LinkProps(PropertyGroup):
-    source: PointerProperty(
+    source = PointerProperty(
         name="Source",
         type=bpy.types.Object,
         description="Linked NURBS/Curve/Surface source object"
     )
-    auto_update: BoolProperty(
+    auto_update = BoolProperty(
         name="Auto Update",
         description="Regenerate mesh when source geometry changes",
         default=True
     )
-    debounce: FloatProperty(
+    debounce = FloatProperty(
         name="Debounce (s)",
         description="Wait time after last change before updating",
         min=0.0, default=0.25, subtype='TIME'
     )
-    apply_modifiers: BoolProperty(
+    apply_modifiers = BoolProperty(
         name="Apply Modifiers from Source",
         description="Include evaluated modifiers when generating mesh",
         default=True
     )
-    preserve_all_data_layers: BoolProperty(
+    preserve_all_data_layers = BoolProperty(
         name="Preserve All Data Layers",
         description="Ask Blender to preserve UVs, vertex groups, etc, when possible",
         default=True
     )
-    note: StringProperty(
+    note = StringProperty(
         name="Note",
         description="Optional note"
     )
@@ -176,7 +268,7 @@ class N2M_OT_link_mesh(Operator):
     bl_label = "Link Mesh Copy"
     bl_options = {'REGISTER', 'UNDO'}
 
-    create_separate_object: BoolProperty(
+    create_separate_object = BoolProperty(
         name="Create New Mesh Object",
         default=True
     )
@@ -220,7 +312,11 @@ class N2M_OT_update_now(Operator):
         # If active is a mesh link, update that one; if a curve/surface, update its targets.
         if obj and obj.type == 'MESH' and getattr(obj, "n2m", None) and obj.n2m.source:
             src = obj.n2m.source
-            _update_now_by_source_name(src.name)
+            if src and getattr(src, 'name', None):
+                _update_now_by_source_name(src.name)
+            else:
+                self.report({'ERROR'}, 'Linked source is missing')
+                return {'CANCELLED'}
             return {'FINISHED'}
         if obj and obj.type in {'CURVE', 'SURFACE'}:
             _update_now_by_source_name(obj.name)
@@ -326,6 +422,85 @@ def _n2m_on_load_post(dummy):
     _TIMERS.clear()
 
 # --------------------------
+# UI integration
+# --------------------------
+
+_ORIGINAL_OBJECT_MENU_DRAW = None
+
+def _n2m_object_menu_draw(self, context):
+    layout = self.layout
+
+    # Recreate Blender's object menu so we can slip in our operator after Duplicate Linked.
+    ob = context.object
+
+    layout.menu("VIEW3D_MT_transform_object")
+    layout.operator_menu_enum("object.origin_set", text="Set Origin", property="type")
+    layout.menu("VIEW3D_MT_mirror")
+    layout.menu("VIEW3D_MT_object_clear")
+    layout.menu("VIEW3D_MT_object_apply")
+    layout.menu("VIEW3D_MT_snap")
+
+    layout.separator()
+
+    layout.operator("object.duplicate_move")
+    layout.operator("object.duplicate_move_linked")
+    layout.operator(N2M_OT_link_mesh.bl_idname, text="Link Mesh Copy", icon='MESH_DATA')
+    layout.operator("object.join")
+
+    layout.separator()
+
+    layout.operator("view3d.copybuffer", text="Copy Objects", icon='COPYDOWN')
+    layout.operator("view3d.pastebuffer", text="Paste Objects", icon='PASTEDOWN')
+
+    layout.separator()
+
+    layout.menu("VIEW3D_MT_object_asset", icon='ASSET_MANAGER')
+    layout.menu("VIEW3D_MT_object_collection")
+
+    layout.separator()
+
+    layout.menu("VIEW3D_MT_object_liboverride", icon='LIBRARY_DATA_OVERRIDE')
+    layout.menu("VIEW3D_MT_object_relations")
+    layout.menu("VIEW3D_MT_object_parent")
+    layout.menu("VIEW3D_MT_object_modifiers", icon='MODIFIER')
+    layout.menu("VIEW3D_MT_object_constraints", icon='CONSTRAINT')
+    layout.menu("VIEW3D_MT_object_track")
+    layout.menu("VIEW3D_MT_make_links")
+
+    layout.separator()
+
+    layout.operator("object.shade_smooth")
+    if ob and ob.type == 'MESH':
+        layout.operator("object.shade_auto_smooth")
+    layout.operator("object.shade_flat")
+
+    layout.separator()
+
+    layout.menu("VIEW3D_MT_object_animation")
+    layout.menu("VIEW3D_MT_object_rigid_body")
+
+    layout.separator()
+
+    layout.menu("VIEW3D_MT_object_quick_effects")
+
+    layout.separator()
+
+    layout.menu("VIEW3D_MT_object_convert")
+
+    layout.separator()
+
+    layout.menu("VIEW3D_MT_object_showhide")
+    layout.menu("VIEW3D_MT_object_cleanup")
+
+    layout.separator()
+
+    layout.operator_context = 'EXEC_REGION_WIN'
+    layout.operator("object.delete", text="Delete").use_global = False
+    layout.operator("object.delete", text="Delete Global").use_global = True
+
+    layout.template_node_operator_asset_menu_items(catalog_path="Object")
+
+# --------------------------
 # Register
 # --------------------------
 
@@ -339,27 +514,36 @@ _CLASSES = (
 )
 
 def register():
+    global _ORIGINAL_OBJECT_MENU_DRAW
+    print('[NURBS2Mesh] register from', __file__)
+    if _ORIGINAL_OBJECT_MENU_DRAW is None:
+        _ORIGINAL_OBJECT_MENU_DRAW = bpy.types.VIEW3D_MT_object.draw
+    bpy.types.VIEW3D_MT_object.draw = _n2m_object_menu_draw
     for c in _CLASSES:
         bpy.utils.register_class(c)
     bpy.types.Object.n2m = PointerProperty(type=N2M_LinkProps)
-    # Handlers
     if _n2m_on_depsgraph_update not in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.append(_n2m_on_depsgraph_update)
     if _n2m_on_load_post not in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.append(_n2m_on_load_post)
+    bpy.app.timers.register(_n2m_heartbeat, first_interval=0.2, persistent=True)
 
 def unregister():
-    # Handlers
+    global _ORIGINAL_OBJECT_MENU_DRAW
+    print('[NURBS2Mesh] unregister from', __file__)
+    if _ORIGINAL_OBJECT_MENU_DRAW is not None:
+        bpy.types.VIEW3D_MT_object.draw = _ORIGINAL_OBJECT_MENU_DRAW
+        _ORIGINAL_OBJECT_MENU_DRAW = None
     if _n2m_on_depsgraph_update in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.remove(_n2m_on_depsgraph_update)
     if _n2m_on_load_post in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.remove(_n2m_on_load_post)
-    # Timers
     for fn in list(_TIMERS.values()):
         if bpy.app.timers.is_registered(fn):
             bpy.app.timers.unregister(fn)
     _TIMERS.clear()
-    # Classes and props
+    if bpy.app.timers.is_registered(_n2m_heartbeat):
+        bpy.app.timers.unregister(_n2m_heartbeat)
     del bpy.types.Object.n2m
     for c in reversed(_CLASSES):
         bpy.utils.unregister_class(c)
