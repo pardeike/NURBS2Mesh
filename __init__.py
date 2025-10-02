@@ -13,7 +13,6 @@ bl_info = {
 
 import hashlib
 import struct
-import time
 import bpy
 from bpy.app.handlers import persistent
 from bpy.props import (
@@ -29,32 +28,35 @@ from bpy.types import (
     PropertyGroup,
 )
 
-_DEBUG_LOG = True
-
-
-def _debug(msg):
-    if _DEBUG_LOG:
-        print(f"[NURBS2Mesh][debug] {msg}")
-
 # --------------------------
 # Internal state
 # --------------------------
 
 _TIMERS = {}  # src_name -> timer function
 
+_FP = {}  # source_name -> last fingerprint
+
+
 def _targets_for_source(src):
     """Find mesh objects linked to a given source object."""
     res = []
     if src is None:
         return res
-    for o in bpy.data.objects:
-        if o.type != 'MESH':
+    src_name = getattr(src, 'name', None)
+    for obj in bpy.data.objects:
+        if obj.type != 'MESH':
             continue
-        link = getattr(o, 'n2m', None)
+        link = getattr(obj, 'n2m', None)
         if not link or not hasattr(link, 'bl_rna'):
             continue
-        if link.source == src and getattr(link, 'auto_update', False):
-            res.append(o)
+        if not getattr(link, 'auto_update', False):
+            continue
+        link_src = getattr(link, 'source', None)
+        if link_src == src:
+            res.append(obj)
+            continue
+        if src_name and getattr(link_src, 'name', None) == src_name:
+            res.append(obj)
     return res
 
 def _first_users_collection(obj, context):
@@ -109,138 +111,92 @@ def _schedule_update(src_obj):
 def _update_now_by_source_name(src_name):
     src = bpy.data.objects.get(src_name)
     if src is None:
+        _FP.pop(src_name, None)
         return
     targets = _targets_for_source(src)
     if not targets:
         return
-    _debug(f"update_now: rebuilding {len(targets)} mesh(es) from {src_name}")
-    for t in targets:
-        if not t.n2m.source:
+    for target in targets:
+        link = getattr(target, 'n2m', None)
+        if not link or not link.source:
             continue
         try:
             mesh = _build_mesh_from_object(
-                t.n2m.source,
-                apply_modifiers=t.n2m.apply_modifiers,
-                preserve_all=t.n2m.preserve_all_data_layers,
+                link.source,
+                apply_modifiers=link.apply_modifiers,
+                preserve_all=link.preserve_all_data_layers,
             )
-            _safe_replace_mesh(t, mesh)
+            _safe_replace_mesh(target, mesh)
         except Exception as ex:
-            print(f"[NURBS2Mesh] Update failed for {t.name}: {ex}")
+            print(f"[NURBS2Mesh] Update failed for {target.name}: {ex}")
 
-# --------------------------
-# Auto-update
-# --------------------------
-
-_FP = {}          # source_name -> last fingerprint
-_PENDING = {}     # source_name -> last change time
 
 def _float_bytes(v: float) -> bytes:
     return struct.pack('<d', float(v))
 
+
 def _curve_fingerprint(src_obj) -> str | None:
-    cu = getattr(src_obj, "data", None)
-    if not cu or not isinstance(cu, bpy.types.Curve):
-        _debug(f"fingerprint: unsupported data for {getattr(src_obj, 'name', '<unknown>')} ({type(cu).__name__ if cu else 'None'})")
+    data = getattr(src_obj, 'data', None)
+    if not data or not isinstance(data, bpy.types.Curve):
         return None
     h = hashlib.blake2b(digest_size=16)
 
-    # Curve datablock settings that affect tessellation
     for name in (
-        "dimensions", "resolution_u", "resolution_v",
-        "render_resolution_u", "render_resolution_v",
-        "bevel_depth", "bevel_resolution", "extrude", "offset",
-        "twist_smooth", "use_fill_caps", "use_fill_deform",
+        'dimensions', 'resolution_u', 'resolution_v',
+        'render_resolution_u', 'render_resolution_v',
+        'bevel_depth', 'bevel_resolution', 'extrude', 'offset',
+        'twist_smooth', 'use_fill_caps', 'use_fill_deform',
     ):
-        if hasattr(cu, name):
-            h.update(str(getattr(cu, name)).encode())
+        if hasattr(data, name):
+            h.update(str(getattr(data, name)).encode())
 
-    # Spline topology + control data
-    for spl in cu.splines:
+    for spl in data.splines:
         h.update(spl.type.encode())
-        for name in ("use_cyclic_u","use_cyclic_v","order_u","order_v","resolution_u","resolution_v"):
+        for name in ('use_cyclic_u', 'use_cyclic_v', 'order_u', 'order_v', 'resolution_u', 'resolution_v'):
             if hasattr(spl, name):
                 h.update(str(getattr(spl, name)).encode())
-
-        if spl.type == 'BEZIER':
+        if spl.type == 'BEZIER' and hasattr(spl, 'bezier_points'):
             for bp in spl.bezier_points:
                 for vec in (bp.handle_left, bp.co, bp.handle_right):
                     for f in vec:
                         h.update(_float_bytes(f))
                 h.update(_float_bytes(bp.tilt))
                 h.update(_float_bytes(bp.radius))
-        elif spl.type == 'NURBS' and hasattr(spl, 'points'):
+        elif spl.type in {'NURBS', 'POLY'} and hasattr(spl, 'points'):
             for p in spl.points:
                 for f in p.co:
                     h.update(_float_bytes(f))
-                h.update(_float_bytes(getattr(p, "tilt", 0.0)))
-                h.update(_float_bytes(getattr(p, "radius", 1.0)))
-        elif spl.type == 'POLY' and hasattr(spl, 'points'):
-            for p in spl.points:
-                for f in p.co:
-                    h.update(_float_bytes(f))
+                h.update(_float_bytes(getattr(p, 'tilt', 0.0)))
+                h.update(_float_bytes(getattr(p, 'radius', 1.0)))
         elif spl.type == 'SURFACE' and hasattr(spl, 'points'):
-            for row in getattr(spl, 'points', []):
-                # Surface splines may expose points as 2D arrays; flatten gracefully.
-                points = row if isinstance(row, (list, tuple)) else [row]
-                for p in points:
+            for row in spl.points:
+                rows = row if isinstance(row, (list, tuple)) else [row]
+                for p in rows:
                     for f in getattr(p, 'co', (0.0, 0.0, 0.0, 0.0)):
                         h.update(_float_bytes(f))
-                    h.update(_float_bytes(getattr(p, "tilt", 0.0)))
-                    h.update(_float_bytes(getattr(p, "radius", 1.0)))
+                    h.update(_float_bytes(getattr(p, 'tilt', 0.0)))
+                    h.update(_float_bytes(getattr(p, 'radius', 1.0)))
         elif hasattr(spl, 'points'):
             for p in spl.points:
                 for f in getattr(p, 'co', (0.0, 0.0, 0.0, 0.0)):
                     h.update(_float_bytes(f))
-                h.update(_float_bytes(getattr(p, "tilt", 0.0)))
-                h.update(_float_bytes(getattr(p, "radius", 1.0)))
-        else:
-            _debug(f"curve_fingerprint: unsupported spline type {spl.type} on {src_obj.name}")
-
-    # Note: bevel/taper object geometry isn’t hashed here; if you use them, tap Update Now.
+                h.update(_float_bytes(getattr(p, 'tilt', 0.0)))
+                h.update(_float_bytes(getattr(p, 'radius', 1.0)))
     return h.hexdigest()
 
-def _linked_sources_active():
-    """Map source -> [targets] for auto-updating links."""
-    links = {}
-    for t in bpy.data.objects:
-        if t.type == 'MESH' and getattr(t, "n2m", None) and t.n2m.source and t.n2m.auto_update:
-            src = t.n2m.source
-            if not getattr(src, "type", None):
-                continue
-            if src.type in {'CURVE', 'SURFACE'}:
-                links.setdefault(src, []).append(t)
-    return links
 
-def _n2m_heartbeat():
-    now = time.time()
-    links = _linked_sources_active()
-    if not links:
-        return 1.0  # sleep longer if nothing to do
-
-    for src, targets in links.items():
-        src_name = getattr(src, 'name', '<unknown>')
-        fp = _curve_fingerprint(src)
-        if not fp:
-            continue
-        prev = _FP.get(src_name)
-        if prev != fp:
-            _FP[src_name] = fp
-            _PENDING[src_name] = now
-            _debug(f"heartbeat: change detected on {src_name}")
-            continue
-
-        last = _PENDING.get(src_name)
-        if last is not None:
-            delay = min(max(t.n2m.debounce, 0.0) for t in targets)
-            if (now - last) >= delay:
-                try:
-                    if src and getattr(src, 'name', None):
-                        _update_now_by_source_name(src.name)
-                        _debug(f"heartbeat: updated {src_name}")
-                finally:
-                    _PENDING.pop(src_name, None)
-
-    return 0.1  # poll rate; cheap and responsive
+def _geometry_changed(src_obj) -> bool:
+    src_name = getattr(src_obj, 'name', None)
+    if not src_name:
+        return False
+    fp = _curve_fingerprint(src_obj)
+    if fp is None:
+        return True
+    prev = _FP.get(src_name)
+    if prev == fp:
+        return False
+    _FP[src_name] = fp
+    return True
 
 # --------------------------
 # Properties
@@ -302,7 +258,7 @@ class N2M_LinkProps(PropertyGroup):
 
 class N2M_OT_link_mesh(Operator):
     bl_idname = "n2m.link_mesh"
-    bl_label = "Link Mesh Copy"
+    bl_label = "Duplicate As Linked Mesh"
     bl_options = {'REGISTER', 'UNDO'}
 
     create_separate_object = BoolProperty(
@@ -324,32 +280,31 @@ class N2M_OT_link_mesh(Operator):
         coll = _first_users_collection(src, context)
         coll.objects.link(new_obj)
 
-        # Keep world transform in sync by parenting, so transform changes don't force remesh.
         if prefs.auto_parent:
             new_obj.parent = src
             new_obj.matrix_parent_inverse = src.matrix_world.inverted()
 
-        # Initialize link properties on the target mesh object.
         link = new_obj.n2m
-        link_source_before = getattr(link, 'source', None)
-        try:
-            auto_before = link.auto_update
-        except Exception as ex:
-            auto_before = f"<error {ex}>"
-        _debug(f"link_mesh: preparing {new_obj.name}; initial source={getattr(link_source_before, 'name', None)} auto={auto_before}")
         link.source = src
         try:
             link.debounce = float(prefs.default_debounce)
-        except Exception as ex:
-            _debug(f"link_mesh: failed to read default debounce ({ex}); falling back to 0.25")
+        except Exception:
             link.debounce = 0.25
         link.auto_update = True
         link.apply_modifiers = True
         link.preserve_all_data_layers = True
-        _debug(f"link_mesh: assigned {new_obj.name}; source={getattr(link.source, 'name', None)} auto={link.auto_update} debounce={link.debounce}")
+
+        view_layer = getattr(context, 'view_layer', None)
+        if view_layer:
+            for obj_sel in list(context.selected_objects):
+                obj_sel.select_set(False)
+        new_obj.select_set(True)
+        if view_layer:
+            view_layer.objects.active = new_obj
 
         self.report({'INFO'}, f"Linked mesh created: {new_obj.name}")
         return {'FINISHED'}
+
 
 class N2M_OT_update_now(Operator):
     bl_idname = "n2m.update_now"
@@ -383,7 +338,10 @@ class N2M_OT_unlink(Operator):
         if obj is None or obj.type != 'MESH' or not getattr(obj, "n2m", None) or not obj.n2m.source:
             self.report({'ERROR'}, "Select a linked mesh to unlink")
             return {'CANCELLED'}
+        src = obj.n2m.source
         obj.n2m.source = None
+        if src and getattr(src, 'name', None):
+            _FP.pop(src.name, None)
         self.report({'INFO'}, "Unlinked mesh from source")
         return {'FINISHED'}
 
@@ -413,7 +371,7 @@ class N2M_PT_panel(Panel):
         layout = self.layout
         o = context.object
         if o.type in {'CURVE', 'SURFACE'}:
-            layout.operator(N2M_OT_link_mesh.bl_idname, icon='MESH_DATA')
+            layout.operator(N2M_OT_link_mesh.bl_idname, text="Duplicate As Linked Mesh", icon='MESH_DATA')
             layout.separator()
             targets = _targets_for_source(o)
             if targets:
@@ -450,14 +408,13 @@ def _n2m_on_depsgraph_update(scene, depsgraph):
         id_ = upd.id
         if isinstance(id_, bpy.types.Object):
             if id_.type in {'CURVE', 'SURFACE'} and upd.is_updated_geometry:
-                delay = _schedule_update(id_)
-                if delay is not None:
-                    _debug(f"depsgraph: scheduled {id_.name} in {delay:.3f}s")
+                if _geometry_changed(id_):
+                    _schedule_update(id_)
         elif isinstance(id_, bpy.types.Curve):
             for obj in (o for o in bpy.data.objects if o.type in {'CURVE', 'SURFACE'} and o.data is id_):
-                delay = _schedule_update(obj)
-                if delay is not None:
-                    _debug(f"depsgraph: scheduled {obj.name} in {delay:.3f}s (datablock)")
+                if _geometry_changed(obj):
+                    _schedule_update(obj)
+
 
 @persistent
 def _n2m_on_load_post(dummy):
@@ -466,6 +423,7 @@ def _n2m_on_load_post(dummy):
         if bpy.app.timers.is_registered(fn):
             bpy.app.timers.unregister(fn)
     _TIMERS.clear()
+    _FP.clear()
 
 # --------------------------
 # UI integration
@@ -490,7 +448,7 @@ def _n2m_object_menu_draw(self, context):
 
     layout.operator("object.duplicate_move")
     layout.operator("object.duplicate_move_linked")
-    layout.operator(N2M_OT_link_mesh.bl_idname, text="Link Mesh Copy", icon='MESH_DATA')
+    layout.operator(N2M_OT_link_mesh.bl_idname, text="Duplicate As Linked Mesh", icon='MESH_DATA')
     layout.operator("object.join")
 
     layout.separator()
@@ -572,7 +530,6 @@ def register():
         bpy.app.handlers.depsgraph_update_post.append(_n2m_on_depsgraph_update)
     if _n2m_on_load_post not in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.append(_n2m_on_load_post)
-    bpy.app.timers.register(_n2m_heartbeat, first_interval=0.2, persistent=True)
 
 def unregister():
     global _ORIGINAL_OBJECT_MENU_DRAW
@@ -588,8 +545,7 @@ def unregister():
         if bpy.app.timers.is_registered(fn):
             bpy.app.timers.unregister(fn)
     _TIMERS.clear()
-    if bpy.app.timers.is_registered(_n2m_heartbeat):
-        bpy.app.timers.unregister(_n2m_heartbeat)
+    _FP.clear()
     del bpy.types.Object.n2m
     for c in reversed(_CLASSES):
         bpy.utils.unregister_class(c)
