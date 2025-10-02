@@ -29,6 +29,13 @@ from bpy.types import (
     PropertyGroup,
 )
 
+_DEBUG_LOG = True
+
+
+def _debug(msg):
+    if _DEBUG_LOG:
+        print(f"[NURBS2Mesh][debug] {msg}")
+
 # --------------------------
 # Internal state
 # --------------------------
@@ -41,7 +48,12 @@ def _targets_for_source(src):
     if src is None:
         return res
     for o in bpy.data.objects:
-        if o.type == 'MESH' and hasattr(o, "n2m") and o.n2m.source == src:
+        if o.type != 'MESH':
+            continue
+        link = getattr(o, 'n2m', None)
+        if not link or not hasattr(link, 'bl_rna'):
+            continue
+        if link.source == src and getattr(link, 'auto_update', False):
             res.append(o)
     return res
 
@@ -74,17 +86,14 @@ def _build_mesh_from_object(src_obj, *, apply_modifiers=True, preserve_all=True)
 def _schedule_update(src_obj):
     """Debounce updates per source using bpy.app.timers."""
     if src_obj is None:
-        return
+        return None
     src_name = src_obj.name
-    # Pick the smallest positive debounce among auto-updating targets.
-    targets = [t for t in _targets_for_source(src_obj) if t.n2m.auto_update]
+    targets = _targets_for_source(src_obj)
     if not targets:
-        return
+        return None
     delay = min(max(t.n2m.debounce, 0.0) for t in targets)
-
     if src_name in _TIMERS:
-        # Timer already scheduled.
-        return
+        return None
 
     def _run():
         try:
@@ -92,16 +101,19 @@ def _schedule_update(src_obj):
         finally:
             _TIMERS.pop(src_name, None)
         return None  # one-shot
+
     _TIMERS[src_name] = _run
     bpy.app.timers.register(_run, first_interval=delay)
+    return delay
 
 def _update_now_by_source_name(src_name):
     src = bpy.data.objects.get(src_name)
     if src is None:
         return
-    targets = [t for t in _targets_for_source(src) if t.n2m.auto_update]
+    targets = _targets_for_source(src)
     if not targets:
         return
+    _debug(f"update_now: rebuilding {len(targets)} mesh(es) from {src_name}")
     for t in targets:
         if not t.n2m.source:
             continue
@@ -127,7 +139,8 @@ def _float_bytes(v: float) -> bytes:
 
 def _curve_fingerprint(src_obj) -> str | None:
     cu = getattr(src_obj, "data", None)
-    if not cu or cu.__class__.__name__ != "Curve":
+    if not cu or not isinstance(cu, bpy.types.Curve):
+        _debug(f"fingerprint: unsupported data for {getattr(src_obj, 'name', '<unknown>')} ({type(cu).__name__ if cu else 'None'})")
         return None
     h = hashlib.blake2b(digest_size=16)
 
@@ -155,12 +168,33 @@ def _curve_fingerprint(src_obj) -> str | None:
                         h.update(_float_bytes(f))
                 h.update(_float_bytes(bp.tilt))
                 h.update(_float_bytes(bp.radius))
-        else:
-            for p in spl.points:  # NURBS/Poly and Surface use SplinePoint(4D)
-                for f in p.co:  # includes weight (w)
+        elif spl.type == 'NURBS' and hasattr(spl, 'points'):
+            for p in spl.points:
+                for f in p.co:
                     h.update(_float_bytes(f))
                 h.update(_float_bytes(getattr(p, "tilt", 0.0)))
                 h.update(_float_bytes(getattr(p, "radius", 1.0)))
+        elif spl.type == 'POLY' and hasattr(spl, 'points'):
+            for p in spl.points:
+                for f in p.co:
+                    h.update(_float_bytes(f))
+        elif spl.type == 'SURFACE' and hasattr(spl, 'points'):
+            for row in getattr(spl, 'points', []):
+                # Surface splines may expose points as 2D arrays; flatten gracefully.
+                points = row if isinstance(row, (list, tuple)) else [row]
+                for p in points:
+                    for f in getattr(p, 'co', (0.0, 0.0, 0.0, 0.0)):
+                        h.update(_float_bytes(f))
+                    h.update(_float_bytes(getattr(p, "tilt", 0.0)))
+                    h.update(_float_bytes(getattr(p, "radius", 1.0)))
+        elif hasattr(spl, 'points'):
+            for p in spl.points:
+                for f in getattr(p, 'co', (0.0, 0.0, 0.0, 0.0)):
+                    h.update(_float_bytes(f))
+                h.update(_float_bytes(getattr(p, "tilt", 0.0)))
+                h.update(_float_bytes(getattr(p, "radius", 1.0)))
+        else:
+            _debug(f"curve_fingerprint: unsupported spline type {spl.type} on {src_obj.name}")
 
     # Note: bevel/taper object geometry isn’t hashed here; if you use them, tap Update Now.
     return h.hexdigest()
@@ -184,24 +218,27 @@ def _n2m_heartbeat():
         return 1.0  # sleep longer if nothing to do
 
     for src, targets in links.items():
+        src_name = getattr(src, 'name', '<unknown>')
         fp = _curve_fingerprint(src)
         if not fp:
             continue
-        prev = _FP.get(src.name)
+        prev = _FP.get(src_name)
         if prev != fp:
-            _FP[src.name] = fp
-            _PENDING[src.name] = now
+            _FP[src_name] = fp
+            _PENDING[src_name] = now
+            _debug(f"heartbeat: change detected on {src_name}")
             continue
 
-        last = _PENDING.get(src.name)
+        last = _PENDING.get(src_name)
         if last is not None:
             delay = min(max(t.n2m.debounce, 0.0) for t in targets)
             if (now - last) >= delay:
                 try:
                     if src and getattr(src, 'name', None):
                         _update_now_by_source_name(src.name)
+                        _debug(f"heartbeat: updated {src_name}")
                 finally:
-                    _PENDING.pop(src.name, None)
+                    _PENDING.pop(src_name, None)
 
     return 0.1  # poll rate; cheap and responsive
 
@@ -212,12 +249,12 @@ def _n2m_heartbeat():
 class N2M_Preferences(AddonPreferences):
     bl_idname = __name__
 
-    default_debounce = FloatProperty(
+    default_debounce: FloatProperty(
         name="Default Debounce (s)",
         description="Delay after last edit before auto-update runs",
         min=0.0, default=0.25, subtype='TIME'
     )
-    auto_parent = BoolProperty(
+    auto_parent: BoolProperty(
         name="Parent new mesh to source",
         description="Keep transforms in sync by parenting mesh copy to source",
         default=True,
@@ -229,32 +266,32 @@ class N2M_Preferences(AddonPreferences):
         layout.prop(self, "auto_parent")
 
 class N2M_LinkProps(PropertyGroup):
-    source = PointerProperty(
+    source: PointerProperty(
         name="Source",
         type=bpy.types.Object,
         description="Linked NURBS/Curve/Surface source object"
     )
-    auto_update = BoolProperty(
+    auto_update: BoolProperty(
         name="Auto Update",
         description="Regenerate mesh when source geometry changes",
         default=True
     )
-    debounce = FloatProperty(
+    debounce: FloatProperty(
         name="Debounce (s)",
         description="Wait time after last change before updating",
         min=0.0, default=0.25, subtype='TIME'
     )
-    apply_modifiers = BoolProperty(
+    apply_modifiers: BoolProperty(
         name="Apply Modifiers from Source",
         description="Include evaluated modifiers when generating mesh",
         default=True
     )
-    preserve_all_data_layers = BoolProperty(
+    preserve_all_data_layers: BoolProperty(
         name="Preserve All Data Layers",
         description="Ask Blender to preserve UVs, vertex groups, etc, when possible",
         default=True
     )
-    note = StringProperty(
+    note: StringProperty(
         name="Note",
         description="Optional note"
     )
@@ -293,11 +330,23 @@ class N2M_OT_link_mesh(Operator):
             new_obj.matrix_parent_inverse = src.matrix_world.inverted()
 
         # Initialize link properties on the target mesh object.
-        new_obj.n2m.source = src
-        new_obj.n2m.debounce = prefs.default_debounce
-        new_obj.n2m.auto_update = True
-        new_obj.n2m.apply_modifiers = True
-        new_obj.n2m.preserve_all_data_layers = True
+        link = new_obj.n2m
+        link_source_before = getattr(link, 'source', None)
+        try:
+            auto_before = link.auto_update
+        except Exception as ex:
+            auto_before = f"<error {ex}>"
+        _debug(f"link_mesh: preparing {new_obj.name}; initial source={getattr(link_source_before, 'name', None)} auto={auto_before}")
+        link.source = src
+        try:
+            link.debounce = float(prefs.default_debounce)
+        except Exception as ex:
+            _debug(f"link_mesh: failed to read default debounce ({ex}); falling back to 0.25")
+            link.debounce = 0.25
+        link.auto_update = True
+        link.apply_modifiers = True
+        link.preserve_all_data_layers = True
+        _debug(f"link_mesh: assigned {new_obj.name}; source={getattr(link.source, 'name', None)} auto={link.auto_update} debounce={link.debounce}")
 
         self.report({'INFO'}, f"Linked mesh created: {new_obj.name}")
         return {'FINISHED'}
@@ -395,23 +444,20 @@ class N2M_PT_panel(Panel):
 
 @persistent
 def _n2m_on_depsgraph_update(scene, depsgraph):
-    # Cheap early-out.
     if not (depsgraph.id_type_updated('OBJECT') or depsgraph.id_type_updated('CURVE')):
         return
-
     for upd in depsgraph.updates:
         id_ = upd.id
-
-        # Object updates: only react to geometry changes for curve/surface objects.
         if isinstance(id_, bpy.types.Object):
             if id_.type in {'CURVE', 'SURFACE'} and upd.is_updated_geometry:
-                _schedule_update(id_)
-
-        # Curve datablock updates: *always* schedule; the flag is not reliable for Curves.
+                delay = _schedule_update(id_)
+                if delay is not None:
+                    _debug(f"depsgraph: scheduled {id_.name} in {delay:.3f}s")
         elif isinstance(id_, bpy.types.Curve):
-            for obj in (o for o in bpy.data.objects
-                        if o.type in {'CURVE', 'SURFACE'} and o.data is id_):
-                _schedule_update(obj)
+            for obj in (o for o in bpy.data.objects if o.type in {'CURVE', 'SURFACE'} and o.data is id_):
+                delay = _schedule_update(obj)
+                if delay is not None:
+                    _debug(f"depsgraph: scheduled {obj.name} in {delay:.3f}s (datablock)")
 
 @persistent
 def _n2m_on_load_post(dummy):
