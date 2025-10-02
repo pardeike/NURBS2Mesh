@@ -1,0 +1,20 @@
+schema_version = "1.0.0"
+
+id = "nurbs2mesh"
+version = "1.0.0"
+name = "NURBS2Mesh"
+tagline = "Auto-updating mesh copies from NURBS/Curves"
+maintainer = "Brrainz <andreas@pardeike.net>"
+type = "add-on"
+
+tags = ["Modeling", "Curves", "Mesh", "Booleans"]
+
+blender_version_min = "4.2.0"
+
+license = [
+  "SPDX:GPL-3.0-or-later",
+]
+
+copyright = [
+  "2025 Andreas Pardeike",
+]
