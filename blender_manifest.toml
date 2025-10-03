@@ -7,7 +7,7 @@ tagline = "Auto-updating mesh copies from NURBS/Curves"
 maintainer = "Brrainz <andreas@pardeike.net>"
 type = "add-on"
 
-tags = ["Modeling", "Curves", "Mesh", "Booleans"]
+tags = ["Modeling", "Mesh"]
 
 blender_version_min = "4.2.0"
 
