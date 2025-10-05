@@ -16,6 +16,7 @@ bl_info = {
 import hashlib
 import struct
 import bpy
+from mathutils import Matrix, Vector
 from bpy.app.handlers import persistent
 from bpy.props import (
     BoolProperty,
@@ -30,14 +31,10 @@ from bpy.types import (
     PropertyGroup,
 )
 
-# --------------------------
-# Internal state
-# --------------------------
+### Internal state
 
 _TIMERS = {}  # src_name -> timer function
-
-_FP = {}  # source_name -> last fingerprint
-
+_FP = {}      # source_name -> last fingerprint
 
 def _targets_for_source(src):
     """Find mesh objects linked to a given source object."""
@@ -74,10 +71,29 @@ def _safe_replace_mesh(obj_mesh, new_mesh):
     if old and old.users == 0:
         bpy.data.meshes.remove(old)
 
+def _first_open_spline_start_local(curve: bpy.types.Curve):
+    opens = [s for s in curve.splines if not getattr(s, "use_cyclic_u", False)]
+    if len(opens) != 1:
+        return None
+    s = opens[0]
+    if s.type == 'BEZIER' and s.bezier_points:
+        return s.bezier_points[0].co.copy()
+    if hasattr(s, "points") and s.points:
+        v = s.points[0].co  # x,y,z,w
+        w = v[3] if v[3] != 0.0 else 1.0
+        return Vector((v[0]/w, v[1]/w, v[2]/w))
+    return None
+
+def _apply_curve_origin_fix(mesh: bpy.types.Mesh, src_obj: bpy.types.Object):
+    data = getattr(src_obj, 'data', None)
+    if not isinstance(data, bpy.types.Curve):
+        return
+    p0 = _first_open_spline_start_local(data)
+    if p0 is None:
+        return
+    mesh.transform(Matrix.Translation(-p0))
+
 def _build_mesh_from_object(src_obj, *, apply_modifiers=True, preserve_all=True):
-    """Create a new Mesh datablock from source object using Blender's conversion."""
-    # Use evaluated object to match viewport conversion, including modifiers.
-    # This follows Blender's documented behavior for new_from_object.
     depsgraph = bpy.context.evaluated_depsgraph_get()
     obj_eval = src_obj.evaluated_get(depsgraph) if apply_modifiers else src_obj
     mesh = bpy.data.meshes.new_from_object(
@@ -85,6 +101,7 @@ def _build_mesh_from_object(src_obj, *, apply_modifiers=True, preserve_all=True)
         preserve_all_data_layers=preserve_all,
         depsgraph=depsgraph if preserve_all else None,
     )
+    _apply_curve_origin_fix(mesh, src_obj)
     return mesh
 
 def _schedule_update(src_obj):
@@ -132,10 +149,8 @@ def _update_now_by_source_name(src_name):
         except Exception as ex:
             print(f"[NURBS2Mesh] Update failed for {target.name}: {ex}")
 
-
 def _float_bytes(v: float) -> bytes:
     return struct.pack('<d', float(v))
-
 
 def _modifier_fingerprint(obj) -> bytes:
     mods = getattr(obj, 'modifiers', None)
@@ -163,8 +178,6 @@ def _modifier_fingerprint(obj) -> bytes:
             entries.append(repr(sorted(props)))
         parts.append('|'.join(str(entry) for entry in entries))
     return '\u0001'.join(parts).encode()
-    return struct.pack('<d', float(v))
-
 
 def _curve_fingerprint(src_obj) -> str | None:
     data = getattr(src_obj, 'data', None)
@@ -230,9 +243,7 @@ def _geometry_changed(src_obj) -> bool:
     _FP[src_name] = fp
     return True
 
-# --------------------------
-# Properties
-# --------------------------
+### Properties
 
 class N2M_Preferences(AddonPreferences):
     bl_idname = __name__
@@ -284,9 +295,7 @@ class N2M_LinkProps(PropertyGroup):
         description="Optional note"
     )
 
-# --------------------------
-# Operators
-# --------------------------
+### Operators
 
 class N2M_OT_link_mesh(Operator):
     bl_idname = "n2m.link_mesh"
@@ -314,7 +323,9 @@ class N2M_OT_link_mesh(Operator):
 
         if prefs.auto_parent:
             new_obj.parent = src
-            new_obj.matrix_parent_inverse = src.matrix_world.inverted()
+            new_obj.matrix_parent_inverse = Matrix.Identity(4)
+            new_obj.matrix_basis = Matrix.Identity(4)
+            new_obj.matrix_world = src.matrix_world
 
         link = new_obj.n2m
         link.source = src
@@ -377,9 +388,7 @@ class N2M_OT_unlink(Operator):
         self.report({'INFO'}, "Unlinked mesh from source")
         return {'FINISHED'}
 
-# --------------------------
-# Panel
-# --------------------------
+### Panel
 
 class N2M_PT_panel(Panel):
     bl_label = "NURBS2Mesh"
@@ -428,9 +437,7 @@ class N2M_PT_panel(Panel):
                 box.operator(N2M_OT_update_now.bl_idname, icon='FILE_REFRESH')
                 box.operator(N2M_OT_unlink.bl_idname, icon='X')
 
-# --------------------------
-# Handlers
-# --------------------------
+### Handlers
 
 @persistent
 def _n2m_on_depsgraph_update(scene, depsgraph):
@@ -450,23 +457,19 @@ def _n2m_on_depsgraph_update(scene, depsgraph):
 
 @persistent
 def _n2m_on_load_post(dummy):
-    # Clear pending timers and rebuild nothing; links are discovered lazily.
     for fn in list(_TIMERS.values()):
         if bpy.app.timers.is_registered(fn):
             bpy.app.timers.unregister(fn)
     _TIMERS.clear()
     _FP.clear()
 
-# --------------------------
-# UI integration
-# --------------------------
+### UI integration
 
 _ORIGINAL_OBJECT_MENU_DRAW = None
 
 def _n2m_object_menu_draw(self, context):
     layout = self.layout
 
-    # Recreate Blender's object menu so we can slip in our operator after Duplicate Linked.
     ob = context.object
 
     layout.menu("VIEW3D_MT_transform_object")
@@ -536,9 +539,7 @@ def _n2m_object_menu_draw(self, context):
 
     layout.template_node_operator_asset_menu_items(catalog_path="Object")
 
-# --------------------------
-# Register
-# --------------------------
+### Register
 
 _CLASSES = (
     N2M_Preferences,
@@ -551,7 +552,6 @@ _CLASSES = (
 
 def register():
     global _ORIGINAL_OBJECT_MENU_DRAW
-    print('[NURBS2Mesh] register from', __file__)
     if _ORIGINAL_OBJECT_MENU_DRAW is None:
         _ORIGINAL_OBJECT_MENU_DRAW = bpy.types.VIEW3D_MT_object.draw
     bpy.types.VIEW3D_MT_object.draw = _n2m_object_menu_draw
@@ -565,7 +565,6 @@ def register():
 
 def unregister():
     global _ORIGINAL_OBJECT_MENU_DRAW
-    print('[NURBS2Mesh] unregister from', __file__)
     if _ORIGINAL_OBJECT_MENU_DRAW is not None:
         bpy.types.VIEW3D_MT_object.draw = _ORIGINAL_OBJECT_MENU_DRAW
         _ORIGINAL_OBJECT_MENU_DRAW = None
