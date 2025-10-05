@@ -6,8 +6,8 @@
 bl_info = {
     "name": "NURBS2Mesh",
     "author": "Andreas",
-    "version": (1, 0, 0),
-    "blender": (4, 0, 0),
+    "version": (1, 0, 1),
+    "blender": (4, 2, 0),
     "location": "Object Properties > NURBS2Mesh",
     "description": "Auto-updating mesh copy from NURBS/Curve/Surface with debounce",
     "category": "Object",
