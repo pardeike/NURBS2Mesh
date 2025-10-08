@@ -3,15 +3,8 @@
 
 # pyright: reportInvalidTypeForm=false
 
-bl_info = {
-    "name": "NURBS2Mesh",
-    "author": "Andreas",
-    "version": (1, 0, 1),
-    "blender": (4, 2, 0),
-    "location": "Object Properties > NURBS2Mesh",
-    "description": "Auto-updating mesh copy from NURBS/Curve/Surface with debounce",
-    "category": "Object",
-}
+from .manifest import parse_manifest
+bl_info = parse_manifest({"location": "Object Properties > NURBS2Mesh", "category": "Object"})
 
 import bpy
 from mathutils import Matrix
