@@ -24,6 +24,7 @@ __all__ = [
     "update_now_by_name",
     "schedule_update",
     "forget_fingerprint",
+    "curve_radius_compensation",
     "depsgraph_update_handler",
     "load_post_handler",
     "clear_runtime_state",
@@ -108,6 +109,28 @@ def _apply_curve_origin_fix(mesh: bpy.types.Mesh, src_obj: Object):
     if start is None:
         return
     mesh.transform(Matrix.Translation(-start))
+
+
+def _first_point_radius(data: bpy.types.Curve) -> Optional[float]:
+    for spline in data.splines:
+        if spline.type == "BEZIER" and spline.bezier_points:
+            return getattr(spline.bezier_points[0], "radius", None)
+        if hasattr(spline, "points") and spline.points:
+            return getattr(spline.points[0], "radius", None)
+    return None
+
+
+def curve_radius_compensation(src_obj: Object) -> float:
+    data = getattr(src_obj, "data", None)
+    if not isinstance(data, bpy.types.Curve):
+        return 1.0
+    radius = _first_point_radius(data)
+    if radius is None:
+        return 1.0
+    radius = float(radius)
+    if radius <= 0.0 or abs(radius - 1.0) < 1e-6:
+        return 1.0
+    return 1.0 / radius
 
 
 def build_mesh_from_source(
@@ -319,6 +342,17 @@ def update_now_by_name(src_name: str, *, include_disabled: bool = False) -> None
                 apply_modifiers=link.apply_modifiers,
                 preserve_all=link.preserve_all_data_layers,
             )
+            parent = mesh_obj.parent
+            factor = 1.0
+            if parent is link.source:
+                factor = getattr(link, "radius_compensation", 1.0)
+                if abs(factor - 1.0) < 1e-6:
+                    computed = curve_radius_compensation(link.source)
+                    if abs(computed - 1.0) > 1e-6:
+                        factor = computed
+                        link.radius_compensation = factor
+                if factor > 0.0 and abs(factor - 1.0) > 1e-6:
+                    mesh.transform(Matrix.Diagonal((factor, factor, factor, 1.0)))
             _replace_object_mesh(mesh_obj, mesh)
         except Exception as ex:  # pragma: no cover - Blender context dependent
             print(f"[NURBS2Mesh] Update failed for {mesh_obj.name}: {ex}")

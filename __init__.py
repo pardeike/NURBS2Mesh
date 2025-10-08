@@ -42,6 +42,7 @@ from .core import (
     forget_fingerprint,
     linked_meshes_for_source,
     load_post_handler,
+    curve_radius_compensation,
     update_now_by_name,
 )
 ### Properties
@@ -95,6 +96,12 @@ class N2M_LinkProps(PropertyGroup):
         name="Note",
         description="Optional note"
     )
+    radius_compensation: FloatProperty(
+        name="Radius Compensation",
+        description="Internal scaling correction for parent radius",
+        default=1.0,
+        options={'HIDDEN'},
+    )
 
 ### Operators
 
@@ -112,6 +119,10 @@ class N2M_OT_link_mesh(Operator):
         prefs = context.preferences.addons[__name__].preferences
 
         mesh = build_mesh_from_source(src)
+        radius_factor = curve_radius_compensation(src)
+        apply_radius_comp = prefs.auto_parent and radius_factor > 0.0 and abs(radius_factor - 1.0) > 1e-6
+        if apply_radius_comp:
+            mesh.transform(Matrix.Diagonal((radius_factor, radius_factor, radius_factor, 1.0)))
         name_base = f"{src.name} Mesh"
         new_obj = bpy.data.objects.new(name_base, mesh)
         coll = first_user_collection(src, context)
@@ -132,6 +143,7 @@ class N2M_OT_link_mesh(Operator):
         link.auto_update = True
         link.apply_modifiers = True
         link.preserve_all_data_layers = True
+        link.radius_compensation = radius_factor if apply_radius_comp else 1.0
 
         view_layer = getattr(context, 'view_layer', None)
         if view_layer:
