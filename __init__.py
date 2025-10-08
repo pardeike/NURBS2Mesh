@@ -31,6 +31,12 @@ from bpy.types import (
     PropertyGroup,
 )
 
+from .menu_injector import (
+    MenuInjectionHandle,
+    register_menu_item,
+    unregister_menu_item,
+)
+
 ### Internal state
 
 _TIMERS = {}  # src_name -> timer function
@@ -465,79 +471,13 @@ def _n2m_on_load_post(dummy):
 
 ### UI integration
 
-_ORIGINAL_OBJECT_MENU_DRAW = None
 
-def _n2m_object_menu_draw(self, context):
-    layout = self.layout
+def _n2m_is_link_mesh_enabled(context):
+    obj = getattr(context, "object", None)
+    return bool(obj and obj.type in {'CURVE', 'SURFACE'})
 
-    ob = context.object
 
-    layout.menu("VIEW3D_MT_transform_object")
-    layout.operator_menu_enum("object.origin_set", text="Set Origin", property="type")
-    layout.menu("VIEW3D_MT_mirror")
-    layout.menu("VIEW3D_MT_object_clear")
-    layout.menu("VIEW3D_MT_object_apply")
-    layout.menu("VIEW3D_MT_snap")
-
-    layout.separator()
-
-    layout.operator("object.duplicate_move")
-    layout.operator("object.duplicate_move_linked")
-    layout.operator(N2M_OT_link_mesh.bl_idname, text="Duplicate As Linked Mesh", icon='MESH_DATA')
-    layout.operator("object.join")
-
-    layout.separator()
-
-    layout.operator("view3d.copybuffer", text="Copy Objects", icon='COPYDOWN')
-    layout.operator("view3d.pastebuffer", text="Paste Objects", icon='PASTEDOWN')
-
-    layout.separator()
-
-    layout.menu("VIEW3D_MT_object_asset", icon='ASSET_MANAGER')
-    layout.menu("VIEW3D_MT_object_collection")
-
-    layout.separator()
-
-    layout.menu("VIEW3D_MT_object_liboverride", icon='LIBRARY_DATA_OVERRIDE')
-    layout.menu("VIEW3D_MT_object_relations")
-    layout.menu("VIEW3D_MT_object_parent")
-    layout.menu("VIEW3D_MT_object_modifiers", icon='MODIFIER')
-    layout.menu("VIEW3D_MT_object_constraints", icon='CONSTRAINT')
-    layout.menu("VIEW3D_MT_object_track")
-    layout.menu("VIEW3D_MT_make_links")
-
-    layout.separator()
-
-    layout.operator("object.shade_smooth")
-    if ob and ob.type == 'MESH':
-        layout.operator("object.shade_auto_smooth")
-    layout.operator("object.shade_flat")
-
-    layout.separator()
-
-    layout.menu("VIEW3D_MT_object_animation")
-    layout.menu("VIEW3D_MT_object_rigid_body")
-
-    layout.separator()
-
-    layout.menu("VIEW3D_MT_object_quick_effects")
-
-    layout.separator()
-
-    layout.menu("VIEW3D_MT_object_convert")
-
-    layout.separator()
-
-    layout.menu("VIEW3D_MT_object_showhide")
-    layout.menu("VIEW3D_MT_object_cleanup")
-
-    layout.separator()
-
-    layout.operator_context = 'EXEC_REGION_WIN'
-    layout.operator("object.delete", text="Delete").use_global = False
-    layout.operator("object.delete", text="Delete Global").use_global = True
-
-    layout.template_node_operator_asset_menu_items(catalog_path="Object")
+_OBJECT_MENU_ITEM: MenuInjectionHandle | None = None
 
 ### Register
 
@@ -551,10 +491,6 @@ _CLASSES = (
 )
 
 def register():
-    global _ORIGINAL_OBJECT_MENU_DRAW
-    if _ORIGINAL_OBJECT_MENU_DRAW is None:
-        _ORIGINAL_OBJECT_MENU_DRAW = bpy.types.VIEW3D_MT_object.draw
-    bpy.types.VIEW3D_MT_object.draw = _n2m_object_menu_draw
     for c in _CLASSES:
         bpy.utils.register_class(c)
     bpy.types.Object.n2m = PointerProperty(type=N2M_LinkProps)
@@ -562,12 +498,23 @@ def register():
         bpy.app.handlers.depsgraph_update_post.append(_n2m_on_depsgraph_update)
     if _n2m_on_load_post not in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.append(_n2m_on_load_post)
+    global _OBJECT_MENU_ITEM
+    if _OBJECT_MENU_ITEM is None:
+        _OBJECT_MENU_ITEM = register_menu_item(
+            menu="VIEW3D_MT_object",
+            operator=N2M_OT_link_mesh,
+            label="Duplicate As Linked Mesh",
+            anchor_operator="object.join",
+            before_anchor=True,
+            is_enabled=_n2m_is_link_mesh_enabled,
+            icon='MESH_DATA',
+        )
 
 def unregister():
-    global _ORIGINAL_OBJECT_MENU_DRAW
-    if _ORIGINAL_OBJECT_MENU_DRAW is not None:
-        bpy.types.VIEW3D_MT_object.draw = _ORIGINAL_OBJECT_MENU_DRAW
-        _ORIGINAL_OBJECT_MENU_DRAW = None
+    global _OBJECT_MENU_ITEM
+    if _OBJECT_MENU_ITEM is not None:
+        unregister_menu_item(_OBJECT_MENU_ITEM)
+        _OBJECT_MENU_ITEM = None
     if _n2m_on_depsgraph_update in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.remove(_n2m_on_depsgraph_update)
     if _n2m_on_load_post in bpy.app.handlers.load_post:
