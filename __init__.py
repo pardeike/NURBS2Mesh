@@ -59,8 +59,7 @@ def _targets_for_source(src):
         link_src = getattr(link, 'source', None)
         if link_src == src:
             res.append(obj)
-            continue
-        if src_name and getattr(link_src, 'name', None) == src_name:
+        elif src_name and getattr(link_src, 'name', None) == src_name:
             res.append(obj)
     return res
 
@@ -75,7 +74,10 @@ def _safe_replace_mesh(obj_mesh, new_mesh):
     old = obj_mesh.data
     obj_mesh.data = new_mesh
     if old and old.users == 0:
+        old_name = getattr(old, "name", None)
         bpy.data.meshes.remove(old)
+        if old_name and getattr(new_mesh, "name", None):
+            new_mesh.name = old_name
 
 def _first_open_spline_start_local(curve: bpy.types.Curve):
     opens = [s for s in curve.splines if not getattr(s, "use_cyclic_u", False)]
@@ -120,7 +122,9 @@ def _schedule_update(src_obj):
         return None
     delay = min(max(t.n2m.debounce, 0.0) for t in targets)
     if src_name in _TIMERS:
-        return None
+        existing = _TIMERS.pop(src_name)
+        if bpy.app.timers.is_registered(existing):
+            bpy.app.timers.unregister(existing)
 
     def _run():
         try:
