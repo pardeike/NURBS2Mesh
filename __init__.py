@@ -21,12 +21,6 @@ from bpy.types import (
     PropertyGroup,
 )
 
-from .menu_injector import (
-    MenuInjectionHandle,
-    register_menu_item,
-    unregister_menu_item,
-)
-
 from .core import (
     build_mesh_from_source,
     clear_runtime_state,
@@ -35,13 +29,12 @@ from .core import (
     forget_fingerprint,
     linked_meshes_for_source,
     load_post_handler,
-    curve_radius_compensation,
     update_now_by_name,
 )
 ### Properties
 
 class N2M_Preferences(AddonPreferences):
-    bl_idname = __name__
+    bl_idname = __package__
 
     default_debounce: FloatProperty(
         name="Default Debounce (s)",
@@ -89,12 +82,6 @@ class N2M_LinkProps(PropertyGroup):
         name="Note",
         description="Optional note"
     )
-    radius_compensation: FloatProperty(
-        name="Radius Compensation",
-        description="Internal scaling correction for parent radius",
-        default=1.0,
-        options={'HIDDEN'},
-    )
 
 ### Operators
 
@@ -104,52 +91,62 @@ class N2M_OT_link_mesh(Operator):
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
-        src = context.object
-        if src is None or src.type not in {'CURVE', 'SURFACE'}:
+        candidates = [obj for obj in context.selected_objects or [] if obj.type in {'CURVE', 'SURFACE'}]
+        if not candidates and context.object and context.object.type in {'CURVE', 'SURFACE'}:
+            candidates = [context.object]
+        if not candidates:
             self.report({'ERROR'}, "Select a NURBS/Curve/Surface object")
             return {'CANCELLED'}
 
-        prefs = context.preferences.addons[__name__].preferences
+        prefs = context.preferences.addons[__package__].preferences
+        created = []
 
-        mesh = build_mesh_from_source(src)
-        radius_factor = curve_radius_compensation(src)
-        apply_radius_comp = prefs.auto_parent and radius_factor > 0.0 and abs(radius_factor - 1.0) > 1e-6
-        if apply_radius_comp:
-            mesh.transform(Matrix.Diagonal((radius_factor, radius_factor, radius_factor, 1.0)))
-        name_base = f"{src.name} Mesh"
-        new_obj = bpy.data.objects.new(name_base, mesh)
-        coll = first_user_collection(src, context)
-        coll.objects.link(new_obj)
+        for src in candidates:
+            curve_data = getattr(src, 'data', None)
+            if hasattr(curve_data, 'use_path') and curve_data.use_path:
+                curve_data.use_path = False
+            if hasattr(curve_data, 'use_radius') and curve_data.use_radius:
+                curve_data.use_radius = False
+            mesh = build_mesh_from_source(src)
+            name_base = f"{src.name} Mesh"
+            new_obj = bpy.data.objects.new(name_base, mesh)
+            coll = first_user_collection(src, context)
+            coll.objects.link(new_obj)
 
-        if prefs.auto_parent:
-            new_obj.parent = src
-            new_obj.matrix_parent_inverse = Matrix.Identity(4)
-            new_obj.matrix_basis = Matrix.Identity(4)
+            view_layer = getattr(context, "view_layer", None)
+            if prefs.auto_parent:
+                new_obj.parent = src
+                new_obj.matrix_parent_inverse = Matrix.Identity(4)
+                new_obj.matrix_basis = Matrix.Identity(4)
             new_obj.matrix_world = src.matrix_world
+            if view_layer and hasattr(view_layer, "update"):
+                view_layer.update()
 
-        link = new_obj.n2m
-        link.source = src
-        try:
-            link.debounce = float(prefs.default_debounce)
-        except Exception:
-            link.debounce = 0.25
-        link.auto_update = True
-        link.apply_modifiers = True
-        link.preserve_all_data_layers = True
-        link.radius_compensation = radius_factor if apply_radius_comp else 1.0
+            link = new_obj.n2m
+            link.source = src
+            try:
+                link.debounce = float(prefs.default_debounce)
+            except Exception:
+                link.debounce = 0.25
+            link.auto_update = True
+            link.apply_modifiers = True
+            link.preserve_all_data_layers = True
 
-        view_layer = getattr(context, 'view_layer', None)
+            created.append(new_obj)
+
+        view_layer = getattr(context, "view_layer", None)
         if view_layer:
             for obj_sel in list(context.selected_objects):
                 obj_sel.select_set(False)
-        new_obj.select_set(True)
-        if view_layer:
-            view_layer.objects.active = new_obj
 
-        self.report({'INFO'}, f"Linked mesh created: {new_obj.name}")
+        for new_obj in created:
+            new_obj.select_set(True)
+
+        if view_layer and created:
+            view_layer.objects.active = created[-1]
+
+        self.report({'INFO'}, f"Linked mesh created: {', '.join(obj.name for obj in created)}")
         return {'FINISHED'}
-
-
 class N2M_OT_update_now(Operator):
     bl_idname = "n2m.update_now"
     bl_label = "Update Now"
@@ -246,7 +243,17 @@ def _n2m_is_link_mesh_enabled(context):
     return bool(obj and obj.type in {'CURVE', 'SURFACE'})
 
 
-_OBJECT_MENU_ITEM: MenuInjectionHandle | None = None
+def _draw_object_menu(self, context):
+    row = self.layout.row()
+    row.enabled = _n2m_is_link_mesh_enabled(context)
+    row.operator(
+        N2M_OT_link_mesh.bl_idname,
+        text="Duplicate As Linked Mesh",
+        icon='MESH_DATA',
+    )
+
+
+_MENU_DRAW_REGISTERED = False
 
 ### Register
 
@@ -268,24 +275,20 @@ def register():
         bpy.app.handlers.depsgraph_update_post.append(depsgraph_update_handler)
     if load_post_handler not in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.append(load_post_handler)
-    global _OBJECT_MENU_ITEM
-    if _OBJECT_MENU_ITEM is None:
-        _OBJECT_MENU_ITEM = register_menu_item(
-            menu="VIEW3D_MT_object",
-            operator=N2M_OT_link_mesh,
-            label="Duplicate As Linked Mesh",
-            anchor_operator="object.join",
-            before_anchor=True,
-            is_enabled=_n2m_is_link_mesh_enabled,
-            icon='MESH_DATA',
-        )
+    global _MENU_DRAW_REGISTERED
+    if not _MENU_DRAW_REGISTERED:
+        bpy.types.VIEW3D_MT_object.append(_draw_object_menu)
+        _MENU_DRAW_REGISTERED = True
     print("Registered NURBS2Mesh")
 
 def unregister():
-    global _OBJECT_MENU_ITEM
-    if _OBJECT_MENU_ITEM is not None:
-        unregister_menu_item(_OBJECT_MENU_ITEM)
-        _OBJECT_MENU_ITEM = None
+    global _MENU_DRAW_REGISTERED
+    if _MENU_DRAW_REGISTERED:
+        try:
+            bpy.types.VIEW3D_MT_object.remove(_draw_object_menu)
+        except ValueError:
+            pass
+        _MENU_DRAW_REGISTERED = False
     if depsgraph_update_handler in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.remove(depsgraph_update_handler)
     if load_post_handler in bpy.app.handlers.load_post:

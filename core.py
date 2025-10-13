@@ -15,7 +15,7 @@ from typing import Iterable, List, Optional
 import bpy
 from bpy.app.handlers import persistent
 from bpy.types import Object
-from mathutils import Matrix, Vector
+from mathutils import Matrix
 
 __all__ = [
     "linked_meshes_for_source",
@@ -24,7 +24,6 @@ __all__ = [
     "update_now_by_name",
     "schedule_update",
     "forget_fingerprint",
-    "curve_radius_compensation",
     "depsgraph_update_handler",
     "load_post_handler",
     "clear_runtime_state",
@@ -35,6 +34,7 @@ __all__ = [
 
 _timers: dict[str, callable] = {}
 _fingerprints: dict[str, str] = {}
+_last_modes: dict[str, str] = {}
 
 
 def clear_runtime_state() -> None:
@@ -44,11 +44,13 @@ def clear_runtime_state() -> None:
             bpy.app.timers.unregister(fn)
     _timers.clear()
     _fingerprints.clear()
+    _last_modes.clear()
 
 
 def forget_fingerprint(src_name: str) -> None:
     """Remove cached state for a source object by name."""
     _fingerprints.pop(src_name, None)
+    _last_modes.pop(src_name, None)
 
 
 # Geometry helpers ----------------------------------------------------------
@@ -87,50 +89,17 @@ def first_user_collection(obj: Object, context: bpy.types.Context):
     return context.scene.collection
 
 
-def _first_open_spline_start_local(curve: bpy.types.Curve):
-    opens = [s for s in curve.splines if not getattr(s, "use_cyclic_u", False)]
-    if len(opens) != 1:
-        return None
-    spline = opens[0]
-    if spline.type == "BEZIER" and spline.bezier_points:
-        return spline.bezier_points[0].co.copy()
-    if hasattr(spline, "points") and spline.points:
-        v = spline.points[0].co  # x, y, z, w
-        w = v[3] if v[3] != 0.0 else 1.0
-        return Vector((v[0] / w, v[1] / w, v[2] / w))
-    return None
-
-
-def _apply_curve_origin_fix(mesh: bpy.types.Mesh, src_obj: Object):
-    data = getattr(src_obj, "data", None)
-    if not isinstance(data, bpy.types.Curve):
-        return
-    start = _first_open_spline_start_local(data)
-    if start is None:
-        return
-    mesh.transform(Matrix.Translation(-start))
-
-
-def _first_point_radius(data: bpy.types.Curve) -> Optional[float]:
-    for spline in data.splines:
-        if spline.type == "BEZIER" and spline.bezier_points:
-            return getattr(spline.bezier_points[0], "radius", None)
-        if hasattr(spline, "points") and spline.points:
-            return getattr(spline.points[0], "radius", None)
-    return None
-
-
-def curve_radius_compensation(src_obj: Object) -> float:
-    data = getattr(src_obj, "data", None)
-    if not isinstance(data, bpy.types.Curve):
-        return 1.0
-    radius = _first_point_radius(data)
-    if radius is None:
-        return 1.0
-    radius = float(radius)
-    if radius <= 0.0 or abs(radius - 1.0) < 1e-6:
-        return 1.0
-    return 1.0 / radius
+def _record_mode_transition(obj: Object) -> bool:
+    """Return True when *obj* just exited Edit mode."""
+    if obj is None or getattr(obj, 'type', None) not in {'CURVE', 'SURFACE'}:
+        return False
+    name = getattr(obj, 'name', None)
+    if not name:
+        return False
+    current = getattr(obj, 'mode', 'OBJECT')
+    previous = _last_modes.get(name)
+    _last_modes[name] = current
+    return previous == 'EDIT' and current != 'EDIT'
 
 
 def build_mesh_from_source(
@@ -147,7 +116,6 @@ def build_mesh_from_source(
         preserve_all_data_layers=preserve_all,
         depsgraph=depsgraph if preserve_all else None,
     )
-    _apply_curve_origin_fix(mesh, src_obj)
     return mesh
 
 
@@ -155,6 +123,12 @@ def _replace_object_mesh(obj_mesh: Object, new_mesh: bpy.types.Mesh) -> None:
     """Attach ``new_mesh`` to ``obj_mesh`` and release the previous datablock."""
     previous = obj_mesh.data
     obj_mesh.data = new_mesh
+
+    if previous and getattr(previous, "materials", None) is not None:
+        new_mesh.materials.clear()
+        for material in previous.materials:
+            new_mesh.materials.append(material)
+
     if previous and previous.users == 0:
         old_name = getattr(previous, "name", None)
         bpy.data.meshes.remove(previous)
@@ -342,18 +316,10 @@ def update_now_by_name(src_name: str, *, include_disabled: bool = False) -> None
                 apply_modifiers=link.apply_modifiers,
                 preserve_all=link.preserve_all_data_layers,
             )
-            parent = mesh_obj.parent
-            factor = 1.0
-            if parent is link.source:
-                factor = getattr(link, "radius_compensation", 1.0)
-                if abs(factor - 1.0) < 1e-6:
-                    computed = curve_radius_compensation(link.source)
-                    if abs(computed - 1.0) > 1e-6:
-                        factor = computed
-                        link.radius_compensation = factor
-                if factor > 0.0 and abs(factor - 1.0) > 1e-6:
-                    mesh.transform(Matrix.Diagonal((factor, factor, factor, 1.0)))
             _replace_object_mesh(mesh_obj, mesh)
+            view_layer = getattr(bpy.context, "view_layer", None)
+            if view_layer and hasattr(view_layer, "update"):
+                view_layer.update()
         except Exception as ex:  # pragma: no cover - Blender context dependent
             print(f"[NURBS2Mesh] Update failed for {mesh_obj.name}: {ex}")
 
@@ -367,8 +333,12 @@ def depsgraph_update_handler(scene, depsgraph):
     for update in depsgraph.updates:
         data_id = update.id
         if isinstance(data_id, bpy.types.Object):
-            if data_id.type in {"CURVE", "SURFACE"} and update.is_updated_geometry:
-                if _geometry_changed(data_id):
+            if data_id.type in {"CURVE", "SURFACE"}:
+                mode_exit = _record_mode_transition(data_id)
+                geometry_changed = (
+                    update.is_updated_geometry and _geometry_changed(data_id)
+                )
+                if geometry_changed or mode_exit:
                     schedule_update(data_id)
         elif isinstance(data_id, bpy.types.Curve):
             for obj in (
@@ -376,7 +346,8 @@ def depsgraph_update_handler(scene, depsgraph):
                 for candidate in bpy.data.objects
                 if candidate.type in {"CURVE", "SURFACE"} and candidate.data is data_id
             ):
-                if _geometry_changed(obj):
+                mode_exit = _record_mode_transition(obj)
+                if _geometry_changed(obj) or mode_exit:
                     schedule_update(obj)
 
 
