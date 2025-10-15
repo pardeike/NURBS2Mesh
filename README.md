@@ -1,6 +1,6 @@
 # NURBS2Mesh
 
-<img width="2434" height="1369" alt="Nurbs2MeshScreenshot" src="https://github.com/user-attachments/assets/62fb45ae-e11d-4b27-a256-1e4a4d998539" />
+<img alt="Nurbs2MeshScreenshot" src="https://github.com/user-attachments/assets/62fb45ae-e11d-4b27-a256-1e4a4d998539" />
 
 NURBS2Mesh keeps a mesh copy in sync with any NURBS, Curve, or Surface object so you can keep a non-destructive workflow and still use mesh-only tools such as Boolean modifiers, physics, and export formats that require polygon data.
 
